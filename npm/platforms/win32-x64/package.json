@@ -1,0 +1,18 @@
+{
+  "name": "@jackwener/wx-cli-win32-x64",
+  "version": "0.6.3",
+  "description": "wx-cli binary for Windows x64",
+  "os": [
+    "win32"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "files": [
+    "bin/"
+  ],
+  "license": "Apache-2.0",
+  "publishConfig": {
+    "access": "public"
+  }
+}
