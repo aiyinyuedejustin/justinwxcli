@@ -11,7 +11,8 @@
 ```sh
 cargo build --release --locked
 mkdir -p bin
-cp target/release/wx bin/wx
+cp target/release/wx bin/wx.new
+mv -f bin/wx.new bin/wx
 ./bin/wx --version
 ```
 
