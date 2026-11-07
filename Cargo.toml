@@ -1,10 +1,10 @@
 [package]
 name = "wx-cli"
-version = "0.6.3"
+version = "0.7.0"
 edition = "2021"
 description = "WeChat 4.x (macOS/Linux) local data CLI — decrypt SQLCipher DBs, query chat history, watch new messages"
 license = "Apache-2.0"
-repository = "https://github.com/botiverse/wx-cli"
+repository = "https://github.com/aiyinyuedejustin/justinwxcli"
 keywords = ["wechat", "sqlcipher", "decrypt", "cli"]
 categories = ["command-line-utilities"]
 readme = "README.md"

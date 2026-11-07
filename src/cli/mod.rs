@@ -1,6 +1,7 @@
 pub mod attachments;
 pub mod biz_articles;
 pub mod contacts;
+pub mod clean;
 pub mod daemon_cmd;
 pub mod doctor;
 pub mod export;
@@ -13,6 +14,7 @@ pub mod media;
 pub mod members;
 pub mod new_messages;
 pub mod output;
+pub mod raw_export;
 pub mod search;
 pub mod sessions;
 pub mod sns_feed;
@@ -54,6 +56,10 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// 查看缓存占用；--apply 停止daemon并清除缓存与日志，保留密钥
+    Clean { #[arg(long)] apply: bool },
+    /// 完整原始消息快照：全部SQL列、无条数限制、跨分片补引用
+    RawExport(raw_export::RawExportArgs),
     /// 初始化：检测数据目录并扫描加密密钥
     Init {
         /// 强制重新扫描（与已有有效密钥合并，不会因部分失败而清空）
@@ -135,26 +141,8 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
-    /// 导出聊天记录到文件
-    Export {
-        /// 聊天对象名称
-        chat: String,
-        /// 起始时间 YYYY-MM-DD
-        #[arg(long)]
-        since: Option<String>,
-        /// 结束时间 YYYY-MM-DD
-        #[arg(long)]
-        until: Option<String>,
-        /// 最多导出条数
-        #[arg(short = 'n', long, default_value = "500")]
-        limit: usize,
-        /// 输出格式 [markdown|txt|json|yaml]
-        #[arg(short = 'f', long, default_value = "markdown", value_parser = ["markdown", "txt", "json", "yaml"])]
-        format: String,
-        /// 输出文件（默认 stdout）
-        #[arg(short = 'o', long)]
-        output: Option<String>,
-    },
+    /// 完整结构化导出：群聊/单聊/跨群，默认JSONL标准输出
+    Export(export::ExportArgs),
     /// 显示有未读消息的会话
     Unread {
         /// 显示数量
@@ -453,6 +441,8 @@ fn dispatch(cli: Cli) -> Result<()> {
     let base_with_meta = cli.with_meta;
     let base_debug_source = cli.debug_source;
     match cli.command {
+        Commands::Clean { apply } => clean::cmd_clean(apply),
+        Commands::RawExport(args) => raw_export::cmd_raw_export(args),
         Commands::Init {
             force,
             hook_seconds,
@@ -512,29 +502,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             },
         ),
         Commands::Contacts { query, limit, json } => contacts::cmd_contacts(query, limit, json),
-        Commands::Export {
-            chat,
-            since,
-            until,
-            limit,
-            format,
-            output,
-        } => {
-            let export_json = format == "json";
-            export::cmd_export(
-                chat,
-                since,
-                until,
-                limit,
-                format,
-                output,
-                OutputOpts {
-                    json: export_json,
-                    with_meta: base_with_meta,
-                    debug_source: base_debug_source,
-                },
-            )
-        }
+        Commands::Export(args) => export::cmd_export(args),
         Commands::Unread {
             limit,
             filter,

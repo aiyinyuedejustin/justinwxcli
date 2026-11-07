@@ -93,34 +93,6 @@ pub fn warning_lines(data: &serde_json::Value) -> Vec<String> {
     lines
 }
 
-pub fn warning_block_text(data: &serde_json::Value) -> Option<String> {
-    let lines = warning_lines(data);
-    if lines.is_empty() {
-        return None;
-    }
-    Some(
-        lines
-            .into_iter()
-            .map(|line| format!("[wx] 警告：{}", line))
-            .collect::<Vec<_>>()
-            .join("\n"),
-    )
-}
-
-pub fn warning_block_markdown(data: &serde_json::Value) -> Option<String> {
-    let lines = warning_lines(data);
-    if lines.is_empty() {
-        return None;
-    }
-    let mut out = String::from("> [!WARNING]\n");
-    for line in lines {
-        out.push_str("> ");
-        out.push_str(&line);
-        out.push('\n');
-    }
-    Some(out)
-}
-
 fn fmt_meta_ts(ts: i64) -> String {
     Local
         .timestamp_opt(ts, 0)

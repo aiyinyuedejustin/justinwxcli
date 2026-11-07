@@ -179,8 +179,8 @@ fn meta_for_global_query(
 }
 
 async fn session_last_timestamp(db: &DbCache, username: &str) -> Option<i64> {
-    let path = match db.get("session/session.db").await {
-        Ok(Some(path)) => path,
+    let conn = match db.open_query_conn("session/session.db").await {
+        Ok(Some((conn, _))) => conn,
         Ok(None) => return None,
         Err(e) => {
             eprintln!(
@@ -194,7 +194,6 @@ async fn session_last_timestamp(db: &DbCache, username: &str) -> Option<i64> {
     let username = username.to_string();
     let username_for_query = username.clone();
     match tokio::task::spawn_blocking(move || -> Result<Option<i64>> {
-        let conn = Connection::open(&path)?;
         let ts = conn
             .query_row(
                 "SELECT last_timestamp FROM SessionTable WHERE username = ?",
@@ -226,13 +225,11 @@ async fn session_last_timestamp(db: &DbCache, username: &str) -> Option<i64> {
 
 /// 加载联系人缓存（从 contact/contact.db）
 pub async fn load_names(db: &DbCache) -> Result<Names> {
-    let path = db.get("contact/contact.db").await?;
+    let opened = db.open_query_conn("contact/contact.db").await?;
     let mut map = HashMap::new();
     let mut verify_flags: HashMap<String, i64> = HashMap::new();
-    if let Some(p) = path {
-        let p2 = p.clone();
+    if let Some((conn, _)) = opened {
         let rows: Vec<(String, String, String, i64)> = tokio::task::spawn_blocking(move || {
-            let conn = Connection::open(&p2).context("打开 contact.db 失败")?;
             let mut stmt =
                 conn.prepare("SELECT username, nick_name, remark, verify_flag FROM contact")?;
             let rows = stmt
@@ -430,7 +427,7 @@ pub async fn q_history(
     } else {
         HashMap::new()
     };
-    let needed = offset.saturating_add(limit);
+    let needed = offset.saturating_add(limit).saturating_add(1);
     // 无时间窗/类型过滤时，可按分片 max_ts 做安全早停（见 history_can_early_stop）
     let allow_early_stop = since.is_none()
         && until.is_none()
@@ -448,7 +445,7 @@ pub async fn q_history(
         let until2 = eff_until;
         let after2 = after_ts;
         let before2 = before_ts;
-        let limit2 = limit;
+        let limit2 = limit.saturating_add(1);
         let offset2 = offset;
 
         let opened = match db.open_query_conn(&rel).await? {
@@ -480,10 +477,14 @@ pub async fn q_history(
         if !msgs.is_empty() {
             shard_hits += 1;
         }
-        all_msgs.extend(msgs);
+        for mut message in msgs {
+            message["shard"] = json!(shard.rel_key);
+            message["message_ref"] = json!({"shard":shard.rel_key,"table":shard.table,"chat_username":username,"local_id":message["local_id"]});
+            all_msgs.push(message);
+        }
 
         if allow_early_stop {
-            all_msgs.sort_by_key(|m| std::cmp::Reverse(m["timestamp"].as_i64().unwrap_or(0)));
+            all_msgs.sort_by_key(|m| std::cmp::Reverse((m["timestamp"].as_i64().unwrap_or(0),m["shard"].as_str().unwrap_or("").to_owned(),m["local_id"].as_i64().unwrap_or(0))));
             all_msgs.truncate(needed.max(1));
             let top_min = all_msgs
                 .iter()
@@ -496,7 +497,8 @@ pub async fn q_history(
         }
     }
 
-    all_msgs.sort_by_key(|m| std::cmp::Reverse(m["timestamp"].as_i64().unwrap_or(0)));
+    all_msgs.sort_by_key(|m| std::cmp::Reverse((m["timestamp"].as_i64().unwrap_or(0),m["shard"].as_str().unwrap_or("").to_owned(),m["local_id"].as_i64().unwrap_or(0))));
+    let truncated = all_msgs.len() > offset.saturating_add(limit);
     let paged: Vec<Value> = all_msgs.into_iter().skip(offset).take(limit).collect();
     let mut paged = paged;
     paged.sort_by_key(|m| m["timestamp"].as_i64().unwrap_or(0));
@@ -525,6 +527,8 @@ pub async fn q_history(
         "is_group": is_group,
         "chat_type": chat_type,
         "count": paged.len(),
+        "truncated":truncated,
+        "next_offset":if truncated {Some(offset+limit)} else {None},
         "messages": paged,
         "meta": meta,
     }))
@@ -727,209 +731,6 @@ pub async fn q_timeline(
     Ok(out)
 }
 
-/// 通过 message_fts.db 的 `*_content` 表做关键词搜索（不依赖 MMFtsTokenizer）。
-///
-/// 列布局：c0=acontent, c1=message_local_id, c2=sort_seq, c3=local_type,
-/// c4=session_id, c5=sender_id, c6=create_time
-async fn search_via_fts(
-    db: &DbCache,
-    names: &Names,
-    keyword: &str,
-    chats: Option<&Vec<String>>,
-    limit: usize,
-    since: Option<i64>,
-    until: Option<i64>,
-) -> Result<Option<Value>> {
-    const FTS_REL: &str = "message/message_fts.db";
-    if db.key_hex(FTS_REL).is_none() {
-        return Ok(None);
-    }
-    let Some((conn, _mode)) = db.open_query_conn(FTS_REL).await? else {
-        return Ok(None);
-    };
-
-    // 预先把 --in CHAT 解析成 username，在同一 conn 上查 name2id（勿二次 online-only open）
-    let filter_unames: Option<Vec<String>> = if let Some(list) = chats {
-        let mut u = Vec::new();
-        for chat in list {
-            if let Some(uname) = resolve_username(chat, names) {
-                u.push(uname);
-            }
-        }
-        if u.is_empty() {
-            return Ok(Some(json!({
-                "keyword": keyword,
-                "count": 0,
-                "results": [],
-            })));
-        }
-        Some(u)
-    } else {
-        None
-    };
-
-    let kw = keyword.to_string();
-    let since2 = since;
-    let until2 = until;
-    let limit2 = limit;
-    let names_map = names.map.clone();
-
-    let results: Vec<Value> = tokio::task::spawn_blocking(move || {
-        // name2id: rowid -> username 与 username -> rowid（session filter）
-        let mut id2name: HashMap<i64, String> = HashMap::new();
-        let mut name2id: HashMap<String, i64> = HashMap::new();
-        {
-            let mut stmt = conn.prepare("SELECT rowid, username FROM name2id")?;
-            let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
-            for row in rows.flatten() {
-                name2id.insert(row.1.clone(), row.0);
-                id2name.insert(row.0, row.1);
-            }
-        }
-
-        let session_filter: Option<HashSet<i64>> = if let Some(ref unames) = filter_unames {
-            let mut ids = HashSet::new();
-            for uname in unames {
-                if let Some(id) = name2id.get(uname) {
-                    ids.insert(*id);
-                }
-            }
-            if ids.is_empty() {
-                return Ok(Vec::new());
-            }
-            Some(ids)
-        } else {
-            None
-        };
-
-        let like = format!("%{}%", escape_like_pattern(&kw));
-        let content_tables = [
-            "message_fts_v4_0_content",
-            "message_fts_v4_1_content",
-            "message_fts_v4_2_content",
-            "message_fts_v4_3_content",
-        ];
-        let mut hits: Vec<(i64, i64, i64, i64, i64, String)> = Vec::new();
-        // (create_time, sort_seq, session_id, sender_id, local_type, snippet)
-
-        // session filter 必须进 SQL：LIMIT 在 filter 之前会导致 --in CHAT 结果不全
-        let session_ids: Option<Vec<i64>> =
-            session_filter.as_ref().map(|s| s.iter().copied().collect());
-
-        for table in content_tables {
-            let exists: bool = conn
-                .query_row(
-                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
-                    [table],
-                    |r| r.get::<_, i64>(0),
-                )
-                .is_ok();
-            if !exists {
-                continue;
-            }
-            let mut clauses = vec!["c0 LIKE ? ESCAPE '\\'".to_string()];
-            let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-            params.push(Box::new(like.clone()));
-            if let Some(s) = since2 {
-                clauses.push("c6 >= ?".into());
-                params.push(Box::new(s));
-            }
-            if let Some(u) = until2 {
-                clauses.push("c6 <= ?".into());
-                params.push(Box::new(u));
-            }
-            if let Some(ref ids) = session_ids {
-                if ids.is_empty() {
-                    continue;
-                }
-                let ph: Vec<&str> = ids.iter().map(|_| "?").collect();
-                clauses.push(format!("c4 IN ({})", ph.join(",")));
-                for id in ids {
-                    params.push(Box::new(*id));
-                }
-            }
-            let sql = format!(
-                "SELECT c0, c1, c2, c3, c4, c5, c6 FROM [{}] WHERE {} ORDER BY c6 DESC LIMIT ?",
-                table,
-                clauses.join(" AND ")
-            );
-            // 多 content 表时多取一些，最终再 truncate
-            params.push(Box::new((limit2 * 4) as i64));
-            let params_ref: Vec<&dyn rusqlite::types::ToSql> =
-                params.iter().map(|p| p.as_ref()).collect();
-            let mut stmt = conn.prepare(&sql)?;
-            let rows = stmt.query_map(params_ref.as_slice(), |r| {
-                Ok((
-                    r.get::<_, String>(0).unwrap_or_default(),
-                    r.get::<_, i64>(1).unwrap_or(0),
-                    r.get::<_, i64>(2).unwrap_or(0),
-                    r.get::<_, i64>(3).unwrap_or(0),
-                    r.get::<_, i64>(4).unwrap_or(0),
-                    r.get::<_, i64>(5).unwrap_or(0),
-                    r.get::<_, i64>(6).unwrap_or(0),
-                ))
-            })?;
-            for row in rows.flatten() {
-                let (snippet, _local_id, sort_seq, local_type, session_id, sender_id, create_time) =
-                    row;
-                hits.push((
-                    create_time,
-                    sort_seq,
-                    session_id,
-                    sender_id,
-                    local_type,
-                    snippet,
-                ));
-            }
-        }
-
-        hits.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)));
-        hits.truncate(limit2);
-
-        let mut out = Vec::new();
-        for (ts, _sort_seq, session_id, sender_id, local_type, snippet) in hits {
-            let talker = id2name
-                .get(&session_id)
-                .cloned()
-                .unwrap_or_else(|| format!("session:{}", session_id));
-            let sender_u = id2name.get(&sender_id).cloned().unwrap_or_default();
-            let display = names_map
-                .get(&talker)
-                .cloned()
-                .unwrap_or_else(|| talker.clone());
-            let sender_display = if sender_u.is_empty() {
-                String::new()
-            } else {
-                names_map
-                    .get(&sender_u)
-                    .cloned()
-                    .unwrap_or_else(|| sender_u.clone())
-            };
-            let mut row = json!({
-                "timestamp": ts,
-                "time": fmt_time(ts, "%Y-%m-%d %H:%M"),
-                "chat": display,
-                "username": talker,
-                "sender": sender_display,
-                "content": snippet,
-                "type": fmt_type(local_type),
-                "source": "message_fts",
-            });
-            // FTS 片段无完整 XML 时 appmsg_type 可能缺失；type_code/type_id 仍可机读
-            attach_type_fields(&mut row, local_type, &snippet);
-            out.push(row);
-        }
-        Ok::<_, anyhow::Error>(out)
-    })
-    .await??;
-
-    Ok(Some(json!({
-        "keyword": keyword,
-        "count": results.len(),
-        "results": results,
-    })))
-}
-
 /// 搜索消息
 pub async fn q_search(
     db: &DbCache,
@@ -943,46 +744,6 @@ pub async fn q_search(
     with_meta: bool,
     debug_source: bool,
 ) -> Result<Value> {
-    // 优先走 message_fts.db 的 content 表（LIKE），避免解密/扫描所有 message_N
-    // 自定义 tokenizer 的 MATCH 路径需要 MMFtsTokenizer，这里用 content 表兜底。
-    if msg_type.is_none() {
-        match search_via_fts(db, names, keyword, chats.as_ref(), limit, since, until).await {
-            Ok(Some(mut v)) => {
-                // Agent-first：与 history/new_messages 一样始终带完整 freshness meta，
-                // 避免 FTS 快路径静默丢掉 unknown_shards / status。
-                let unknown_shards = current_unknown_shards(db, names);
-                let windowed = since.is_some() || until.is_some() || chats.is_some();
-                let hit = v.get("count").and_then(|c| c.as_u64()).unwrap_or(0) as usize;
-                let meta = meta_for_global_query(
-                    1,
-                    if hit > 0 { 1 } else { 0 },
-                    unknown_shards,
-                    windowed,
-                    with_meta,
-                    debug_source,
-                    Some(HashMap::from([(
-                        "message/message_fts.db".into(),
-                        "online_or_cache".into(),
-                    )])),
-                    None,
-                );
-                if let Some(obj) = v.as_object_mut() {
-                    let mut meta_v = serde_json::to_value(&meta).unwrap_or(json!({}));
-                    if let Some(m) = meta_v.as_object_mut() {
-                        m.insert("source".into(), json!("message_fts"));
-                        m.insert("mode".into(), json!("fts_content_like"));
-                    }
-                    obj.insert("meta".into(), meta_v);
-                }
-                return Ok(v);
-            }
-            Ok(None) => {}
-            Err(e) => {
-                eprintln!("[search] FTS 路径失败，回退全库扫描: {:#}", e);
-            }
-        }
-    }
-
     let mut targets: Vec<(String, String, String, String, String)> = Vec::new(); // (rel_key, path, table, display, uname)
     let mut scanned_rel_keys: HashSet<String> = HashSet::new();
     let mut cache_modes: HashMap<String, String> = HashMap::new();
@@ -1034,8 +795,7 @@ pub async fn q_search(
                     )?;
                     let table_names: Vec<String> = stmt
                         .query_map([], |row| row.get(0))?
-                        .filter_map(|r| r.ok())
-                        .collect();
+                        .collect::<rusqlite::Result<Vec<_>>>()?;
 
                     let re = msg_table_re();
                     let mut result = Vec::new();
@@ -1066,14 +826,8 @@ pub async fn q_search(
                 .await
                 {
                     Ok(Ok(v)) => v,
-                    Ok(Err(e)) => {
-                        eprintln!("[search] skip DB {}: {}", rel_key, e);
-                        continue;
-                    }
-                    Err(e) => {
-                        eprintln!("[search] task error {}: {}", rel_key, e);
-                        continue;
-                    }
+                    Ok(Err(e)) => return Err(e.context(format!("枚举消息表失败: {rel_key}"))),
+                    Err(e) => return Err(e.into()),
                 };
 
             targets.extend(table_targets);
@@ -1163,13 +917,12 @@ pub async fn q_search(
                                     );
                                 }
                             }
+                            row["shard"] = json!(rel_key);
+                            row["message_ref"] = json!({"shard":rel_key,"table":tname,"chat_username":uname,"local_id":row["local_id"]});
                             all.push(row);
                         }
                     }
-                    Err(e) => eprintln!(
-                        "[search] skip table {} (db={}): {}",
-                        tname, db_path_for_log, e
-                    ),
+                    Err(e) => return Err(e.context(format!("搜索消息表失败: {tname}"))),
                 }
             }
             Ok((db_path_for_log, all))
@@ -1188,12 +941,13 @@ pub async fn q_search(
                 }
                 results.extend(rows)
             }
-            Ok(Err(e)) => eprintln!("[search] skip DB: {}", e),
-            Err(e) => eprintln!("[search] task error: {}", e),
+            Ok(Err(e)) => return Err(e),
+            Err(e) => return Err(e.into()),
         }
     }
 
     results.sort_by_key(|r| std::cmp::Reverse(r["timestamp"].as_i64().unwrap_or(0)));
+    let truncated = results.len() > limit;
     let paged: Vec<Value> = results.into_iter().take(limit).collect();
     let unknown_shards = current_unknown_shards(db, names);
     // 全局搜索 / keyword 过滤天然是窗口化结果，没有稳定的 chat-level latest baseline，
@@ -1208,7 +962,7 @@ pub async fn q_search(
         Some(cache_modes),
         Some(shard_paths),
     );
-    Ok(json!({ "keyword": keyword, "count": paged.len(), "results": paged, "meta": meta }))
+    Ok(json!({ "keyword": keyword, "count": paged.len(), "results": paged, "truncated":truncated, "meta": meta }))
 }
 
 /// 查询联系人
@@ -1285,12 +1039,7 @@ fn resolve_username(chat_name: &str, names: &Names) -> Option<String> {
         .map(|(uname, _)| uname.clone())
 }
 
-/// 定位 talker 所在消息分片。
-///
-/// 优化点（对齐 other-wx-cli / 用户反馈）：
-/// 1. 加密源 mtime 降序：优先热分片，避免先解密冷库
-/// 2. `shard-meta.json` **按表** 时间窗过滤：since/until 可跳过不重叠分片
-/// 3. 打开后写回 per-table min/max create_time + Timestamp 表
+/// Inspect live tables and bounds, including WAL updates; sort newest shards first.
 async fn find_msg_shards(
     db: &DbCache,
     names: &Names,
@@ -1303,33 +1052,17 @@ async fn find_msg_shards(
         return Ok((Vec::new(), 0));
     }
 
-    let mut meta_file = super::shard_meta::load();
-    let ordered = super::shard_meta::sort_rel_keys_by_mtime(db.db_dir(), &names.msg_db_keys);
+    let ordered = &names.msg_db_keys;
 
     let mut scanned = 0usize;
     let mut results: Vec<MessageShard> = Vec::new();
-    let mut meta_dirty = false;
 
-    for rel_key in &ordered {
+    for rel_key in ordered {
         let src_path = db
             .db_dir()
             .join(rel_key.replace('/', std::path::MAIN_SEPARATOR_STR));
-        let src_mtime = super::shard_meta::source_mtime_ns(&src_path);
-        let entry = meta_file.shards.get(rel_key);
-        if !super::shard_meta::may_overlap(entry, src_mtime, &table_name, since, until) {
-            continue;
-        }
-        if entry
-            .map(|e| e.missing_tables.iter().any(|t| t == &table_name))
-            .unwrap_or(false)
-            && entry
-                .map(|e| e.source_mtime_ns == src_mtime || e.source_mtime_ns == 0)
-                .unwrap_or(false)
-        {
-            // 上次确认该 talker 表不在此分片，且源文件未变
-            continue;
-        }
-
+        // WAL can add rows or tables while the main DB mtime stays unchanged.
+        // Inspect the live schema; cached bounds are observations, not exclusion evidence.
         let opened = match db.open_query_conn(rel_key).await? {
             Some(v) => v,
             None => continue,
@@ -1375,26 +1108,7 @@ async fn find_msg_shards(
             .await??;
 
         let (exists, min_ts, max_ts, shard_start) = stats;
-        if !exists {
-            let e = meta_file.shards.entry(rel_key.clone()).or_default();
-            if !e.missing_tables.iter().any(|t| t == &table_name) {
-                e.missing_tables.push(table_name.clone());
-            }
-            e.source_mtime_ns = src_mtime;
-            meta_dirty = true;
-            continue;
-        }
-
-        super::shard_meta::record_open(
-            &mut meta_file,
-            rel_key,
-            &src_path,
-            &table_name,
-            min_ts,
-            max_ts,
-            shard_start,
-        );
-        meta_dirty = true;
+        if !exists { continue; }
 
         // 打开后二次时间窗过滤（meta 可能首次建立）
         if let (Some(s), Some(hi)) = (since, max_ts) {
@@ -1417,10 +1131,6 @@ async fn find_msg_shards(
                 cache_mode,
             });
         }
-    }
-
-    if meta_dirty {
-        super::shard_meta::save(&meta_file);
     }
 
     // 按最大时间戳降序排列（最新的优先）
@@ -1509,7 +1219,7 @@ fn query_messages_conn(
     let sql = format!(
         "SELECT local_id, local_type, create_time, real_sender_id,
                 message_content, WCDB_CT_message_content
-         FROM [{}] {} ORDER BY create_time DESC LIMIT ? OFFSET ?",
+         FROM [{}] {} ORDER BY create_time DESC, local_id DESC LIMIT ? OFFSET ?",
         table, where_clause
     );
 
@@ -1529,8 +1239,7 @@ fn query_messages_conn(
                 row.get::<_, i64>(5).unwrap_or(0),
             ))
         })?
-        .filter_map(|r| r.ok())
-        .collect::<Vec<_>>();
+        .collect::<rusqlite::Result<Vec<_>>>()?;
 
     let mut result = Vec::new();
     for (local_id, local_type, ts, real_sender_id, content_bytes, ct) in rows {
@@ -1553,6 +1262,8 @@ fn query_messages_conn(
             "time": fmt_time(ts, "%Y-%m-%d %H:%M"),
             "sender": sender,
             "content": text,
+            "raw_content": content,
+            "chat_username": chat_username,
             "type": fmt_type(local_type),
             "local_id": local_id,
         });
@@ -1580,19 +1291,9 @@ fn search_in_table(
     limit: usize,
 ) -> Result<Vec<Value>> {
     let id2u = load_id2u(conn);
-    // 转义 LIKE 通配符，使用 '\' 作为 ESCAPE 字符
-    let escaped_kw = keyword
-        .replace('\\', "\\\\")
-        .replace('%', "\\%")
-        .replace('_', "\\_");
-    let search_decoded_content = msg_type == Some(49);
     let keyword_lower = keyword.to_lowercase();
     let mut clauses: Vec<String> = Vec::new();
     let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-    if !search_decoded_content {
-        clauses.push("message_content LIKE ? ESCAPE '\\'".to_string());
-        params.push(Box::new(format!("%{}%", escaped_kw)));
-    }
     if let Some(s) = since {
         clauses.push("create_time >= ?".into());
         params.push(Box::new(s));
@@ -1609,39 +1310,22 @@ fn search_in_table(
     } else {
         format!("WHERE {}", clauses.join(" AND "))
     };
-    let limit_clause = if search_decoded_content {
-        ""
-    } else {
-        " LIMIT ?"
-    };
     let sql = format!(
-        "SELECT local_id, local_type, create_time, real_sender_id,
-                message_content, WCDB_CT_message_content
-         FROM [{}] {} ORDER BY create_time DESC{}",
-        table, where_clause, limit_clause
+        "SELECT local_id, local_type, create_time, real_sender_id, message_content, WCDB_CT_message_content
+         FROM [{}] {} ORDER BY create_time DESC, local_id DESC", table, where_clause
     );
-    if !search_decoded_content {
-        params.push(Box::new(limit as i64));
-    }
 
     let params_ref: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
     let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt
-        .query_map(params_ref.as_slice(), |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, i64>(2)?,
-                row.get::<_, i64>(3)?,
-                get_content_bytes(row, 4),
-                row.get::<_, i64>(5).unwrap_or(0),
-            ))
-        })?
-        .filter_map(|r| r.ok())
-        .collect::<Vec<_>>();
-
+    let mut rows = stmt.query(params_ref.as_slice())?;
     let mut result = Vec::new();
-    for (local_id, local_type, ts, real_sender_id, content_bytes, ct) in rows {
+    while let Some(row) = rows.next()? {
+        let local_id: i64 = row.get(0)?;
+        let local_type: i64 = row.get(1)?;
+        let ts: i64 = row.get(2)?;
+        let real_sender_id: i64 = row.get(3)?;
+        let content_bytes = get_content_bytes(row, 4);
+        let ct: i64 = row.get(5)?;
         let content = decompress_message(&content_bytes, ct);
         let sender_username = sender_username(real_sender_id, &content, is_group, chat_username, &id2u);
         let sender = sender_label(
@@ -1654,7 +1338,7 @@ fn search_in_table(
             group_nicknames,
         );
         let text = fmt_content(local_id, local_type, &content, is_group);
-        if search_decoded_content && !matches_search_text(&content, &text, keyword, &keyword_lower)
+        if !matches_search_text(&content, &text, keyword, &keyword_lower)
         {
             continue;
         }
@@ -1664,8 +1348,11 @@ fn search_in_table(
             "timestamp": ts,
             "time": fmt_time(ts, "%Y-%m-%d %H:%M"),
             "chat": "",
+            "local_id": local_id,
             "sender": sender,
             "content": text,
+            "raw_content": content,
+            "chat_username": chat_username,
             "type": fmt_type(local_type),
         });
         attach_type_fields(&mut msg, local_type, &content);
@@ -1674,7 +1361,7 @@ fn search_in_table(
             msg["url"] = serde_json::Value::String(u);
         }
         result.push(msg);
-        if search_decoded_content && result.len() >= limit {
+        if result.len() >= limit {
             break;
         }
     }
@@ -1723,12 +1410,11 @@ async fn load_group_nicknames(
     if !chat_username.contains("@chatroom") {
         return Ok(HashMap::new());
     }
-    let Some(contact_p) = db.get("contact/contact.db").await? else {
+    let Some((conn, _)) = db.open_query_conn("contact/contact.db").await? else {
         return Ok(HashMap::new());
     };
     let chat = chat_username.to_string();
     tokio::task::spawn_blocking(move || {
-        let conn = Connection::open(&contact_p)?;
         Ok::<_, anyhow::Error>(load_group_nickname_map_from_conn(&conn, &chat, None))
     })
     .await?
@@ -1741,11 +1427,10 @@ async fn load_group_nickname_maps(
     if chat_usernames.is_empty() {
         return Ok(HashMap::new());
     }
-    let Some(contact_p) = db.get("contact/contact.db").await? else {
+    let Some((conn, _)) = db.open_query_conn("contact/contact.db").await? else {
         return Ok(HashMap::new());
     };
     tokio::task::spawn_blocking(move || {
-        let conn = Connection::open(&contact_p)?;
         let mut out = HashMap::new();
         for chat in chat_usernames {
             let nicknames = load_group_nickname_map_from_conn(&conn, &chat, None);
@@ -1758,7 +1443,7 @@ async fn load_group_nickname_maps(
     .await?
 }
 
-fn load_group_nickname_map_from_conn(
+pub(crate) fn load_group_nickname_map_from_conn(
     conn: &Connection,
     chat_username: &str,
     targets: Option<&HashSet<String>>,
@@ -2078,7 +1763,7 @@ fn contact_display(
     }
 }
 
-fn sender_display(
+pub(crate) fn sender_display(
     username: &str,
     fallback_sender_name: &str,
     names: &HashMap<String, String>,
@@ -2135,6 +1820,12 @@ fn group_top_senders(
     top_senders
 }
 
+pub(crate) fn legacy_sender_prefix(content: &str) -> Option<(&str, &str)> {
+    let (sender, text) = content.split_once(":\n")?;
+    (sender.starts_with("wxid_") && sender.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_'))
+        .then_some((sender, text))
+}
+
 fn sender_username(
     real_sender_id: i64,
     content: &str,
@@ -2144,7 +1835,7 @@ fn sender_username(
 ) -> String {
     let sender_uname = id2u.get(&real_sender_id).cloned().unwrap_or_default();
     if !is_group {
-        if !sender_uname.is_empty() && sender_uname != chat_username {
+        if !sender_uname.is_empty() {
             return sender_uname;
         }
         return String::new();
@@ -2152,8 +1843,8 @@ fn sender_username(
     if !sender_uname.is_empty() && sender_uname != chat_username {
         return sender_uname;
     }
-    if content.contains(":\n") {
-        return content.splitn(2, ":\n").next().unwrap_or("").to_string();
+    if let Some((sender, _)) = legacy_sender_prefix(content) {
+        return sender.to_string();
     }
     String::new()
 }
@@ -2165,16 +1856,18 @@ fn add_sender_identity(
     names: &HashMap<String, String>,
     group_nicknames: &HashMap<String, String>,
 ) {
-    if !is_group || username.is_empty() {
+    if username.is_empty() {
         return;
     }
     row["sender_username"] = Value::String(username.to_string());
     row["sender_contact_display"] = Value::String(
         names.get(username).cloned().unwrap_or_else(|| username.to_string())
     );
-    row["sender_group_nickname"] = Value::String(
-        group_nicknames.get(username).cloned().unwrap_or_default()
-    );
+    if is_group {
+        row["sender_group_nickname"] = Value::String(
+            group_nicknames.get(username).cloned().unwrap_or_default()
+        );
+    }
 }
 
 fn sender_label(
@@ -2191,13 +1884,12 @@ fn sender_label(
         if !sender_uname.is_empty() && sender_uname != chat_username {
             return sender_display(&sender_uname, "", names, group_nicknames);
         }
-        if content.contains(":\n") {
-            let raw = content.splitn(2, ":\n").next().unwrap_or("");
+        if let Some((raw, _)) = legacy_sender_prefix(content) {
             return sender_display(raw, "", names, group_nicknames);
         }
         return String::new();
     }
-    if !sender_uname.is_empty() && sender_uname != chat_username {
+    if !sender_uname.is_empty() {
         return names.get(&sender_uname).cloned().unwrap_or(sender_uname);
     }
     String::new()
@@ -2311,7 +2003,7 @@ pub fn attach_type_fields(msg: &mut Value, local_type: i64, content: &str) {
     }
 }
 
-fn fmt_content(local_id: i64, local_type: i64, content: &str, is_group: bool) -> String {
+pub(crate) fn fmt_content(local_id: i64, local_type: i64, content: &str, is_group: bool) -> String {
     let base = (local_type as u64 & 0xFFFFFFFF) as i64;
     match base {
         3 => return format!("[图片] local_id={}", local_id),
@@ -2324,8 +2016,8 @@ fn fmt_content(local_id: i64, local_type: i64, content: &str, is_group: bool) ->
         _ => {}
     }
 
-    let text = if is_group && content.contains(":\n") {
-        content.splitn(2, ":\n").nth(1).unwrap_or(content)
+    let text = if is_group {
+        legacy_sender_prefix(content).map(|(_, text)| text).unwrap_or(content)
     } else {
         content
     };
@@ -3086,11 +2778,11 @@ mod appmsg_tests {
             "sender_username 必须区分两位同名成员"
         );
 
-        // 非群 chat 不该追加 identity 字段（行为对齐 history/search/new-messages）
+        // 单聊保留稳定发送者身份，群名片仅在群聊输出。
         let mut private_row = json!({"attachment_id": "ghi", "sender": ""});
         add_sender_identity(&mut private_row, false, "wxid_alice", &names, &group_nicknames);
-        assert!(private_row.get("sender_username").is_none());
-        assert!(private_row.get("sender_contact_display").is_none());
+        assert_eq!(private_row["sender_username"], "wxid_alice");
+        assert!(private_row.get("sender_contact_display").is_some());
         assert!(private_row.get("sender_group_nickname").is_none());
 
         // group 但 sender_username 解析为空（非常老的格式、id2u 没命中、content 也没 wxid_xxx:\n 前缀）：
@@ -3397,12 +3089,11 @@ pub async fn q_members(db: &DbCache, names: &Names, chat: &str) -> Result<Value>
     let names_map = names.map.clone();
 
     // 优先路径：contact.db → chatroom_member + chat_room（完整成员列表）
-    if let Some(contact_p) = db.get("contact/contact.db").await? {
+    if let Some((conn, _)) = db.open_query_conn("contact/contact.db").await? {
         let uname2 = username.clone();
         let names_map2 = names_map.clone();
 
         let members_opt: Option<Vec<Value>> = tokio::task::spawn_blocking(move || {
-            let conn = Connection::open(&contact_p)?;
 
             let has_table: bool = conn
                 .query_row(
@@ -6048,5 +5739,30 @@ mod sns_tests {
         assert_eq!(item.get("width").and_then(Value::as_i64), Some(640));
         assert_eq!(item.get("height").and_then(Value::as_i64), Some(480));
         assert!(!item.contains_key("total_size"));
+    }
+}
+
+#[cfg(test)]
+mod source_integrity_tests {
+    use super::*;
+    #[test]
+    fn group_colon_newline_is_content_and_private_sender_is_retained() {
+        assert_eq!(fmt_content(1,1,"说明:\n正文",true),"说明:\n正文");
+        assert_eq!(fmt_content(1,1,"wxid_alice:\n正文",true),"正文");
+        let names=HashMap::from([(1,"wxid_alice".to_owned())]);
+        assert_eq!(sender_username(1,"hello",false,"wxid_alice",&names),"wxid_alice");
+    }
+    #[test]
+    fn compressed_text_search_and_same_second_offset_keep_all_rows() {
+        let conn=Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE Name2Id(user_name TEXT); INSERT INTO Name2Id VALUES('wxid_alice'); CREATE TABLE Msg_test(local_id INTEGER,local_type INTEGER,create_time INTEGER,real_sender_id INTEGER,message_content BLOB,WCDB_CT_message_content INTEGER);").unwrap();
+        let compressed=zstd::stream::encode_all("computer use https://huggingface.co/test".as_bytes(),1).unwrap();
+        for id in 1..=3 {conn.execute("INSERT INTO Msg_test VALUES(?1,1,100,1,?2,4)",rusqlite::params![id,compressed]).unwrap();}
+        let names=HashMap::new();
+        let hits=search_in_table(&conn,"Msg_test","wxid_alice",false,&names,&names,"computer",None,None,Some(1),10).unwrap();
+        assert_eq!(hits.len(),3);
+        let mut ids=HashSet::new();
+        for offset in 0..3 {let page=query_messages_conn(&conn,"Msg_test","wxid_alice",false,&names,&names,None,None,None,None,None,1,offset).unwrap();ids.insert(page[0]["local_id"].as_i64().unwrap());}
+        assert_eq!(ids.len(),3);
     }
 }

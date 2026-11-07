@@ -124,7 +124,7 @@ fn run_checks() -> Vec<Check> {
             name: "WeChat 签名".into(),
             ok: Path::new("/Applications/WeChat.app").exists(),
             detail: kind.into(),
-            fix: Some("官网包可为 ad-hoc；官方 Developer ID 包请 sudo 内存扫描".into()),
+            fix: Some("Hardened Runtime 且缺 get-task-allow 时系统拒绝取钥；已有有效密钥可继续查询".into()),
         });
     }
 

@@ -9,7 +9,7 @@
 ///    - 捕获 32-byte AES key，用 SQLCipher 4 HMAC 与磁盘 DB 匹配
 ///    - Hardened Runtime 官方包建议 sudo；部分官网包本身 ad-hoc，用户态 LLDB 即可
 ///
-/// 官方 Hardened Runtime 包在本机 GUI Terminal + sudo 下通常可 `task_for_pid`；
+/// 官方 Hardened Runtime 包还受目标 get-task-allow 授权约束；
 /// 部分官网包本身就是 ad-hoc，无需也不应再重签。
 use anyhow::{bail, Context, Result};
 use std::collections::HashSet;
@@ -19,7 +19,7 @@ use std::time::Duration;
 
 use super::{
     collect_db_salts, collect_salt_adjacent_keys, decode_salt_hex, match_key_hexes, unique_key_hexes,
-    scan_key_patterns, KeyEntry, MAX_PATTERN_BYTES,
+    scan_key_patterns, scan_masked_key_patterns, KeyEntry, MAX_PATTERN_BYTES,
 };
 
 // Mach 相关常量
@@ -130,7 +130,7 @@ pub fn scan_keys_with_options(
     match signature {
         SignatureKind::AdHoc => eprintln!("WeChat 签名: ad-hoc（无需再次签名；用户态 LLDB 通常可附加）"),
         SignatureKind::HardenedRuntime => {
-            eprintln!("WeChat 签名: 官方 Hardened Runtime（内存扫描需要 sudo；hook 也建议 sudo）")
+            eprintln!("WeChat 签名: 官方 Hardened Runtime（进程读取受目标调试授权约束）")
         }
         SignatureKind::Unknown => eprintln!("WeChat 签名: 未能识别（继续尝试）"),
     }
@@ -291,9 +291,9 @@ fn obtain_task_port(pid: libc::pid_t, signature: SignatureKind) -> Result<mach_p
              Terminal，并在系统提示时允许「开发者工具」权限。"
         }
         SignatureKind::HardenedRuntime => {
-            "当前 WeChat 是官方 Hardened Runtime 签名。请从本机 GUI Terminal \
-             重试，并在「隐私与安全性 → 开发者工具」中允许该 Terminal。只有 SSH \
-             等无 GUI 场景仍被拒绝时，才考虑有副作用的 ad-hoc 重签。"
+            "当前微信启用 Hardened Runtime。若签名缺少 com.apple.security.get-task-allow，\n\
+             macOS 会拒绝进程读取，即使本机终端使用 sudo。已有有效数据库密钥可继续查询。\n\
+             查看 README 与 docs/macos-permission-guide.md；改变微信签名需要用户单独决定。"
         }
         SignatureKind::Unknown => {
             "请从本机 GUI Terminal 重试，并检查「隐私与安全性 → 开发者工具」权限。"
@@ -441,6 +441,7 @@ fn scan_region(
             let buf: &[u8] = unsafe { std::slice::from_raw_parts(data as *const u8, dc as usize) };
 
             search_pattern(buf, raw_keys);
+            scan_masked_key_patterns(buf, raw_keys);
             collect_salt_adjacent_keys(buf, salts, extra_keys, seen_extra);
             bytes_read += dc as u64;
 

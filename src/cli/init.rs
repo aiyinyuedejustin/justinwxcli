@@ -185,6 +185,12 @@ pub fn cmd_init(force: bool, hook_seconds: Option<u64>) -> Result<()> {
 
     std::fs::write(&config_path, serde_json::to_string_pretty(&cfg)?)
         .context("写入 config.json 失败")?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&keys_file_path, std::fs::Permissions::from_mode(0o600))?;
+        std::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o600))?;
+    }
     println!("配置已保存: {}", config_path.display());
     println!("初始化完成，可以使用 wx sessions / wx history 等命令了");
 
@@ -197,7 +203,7 @@ pub fn cmd_init(force: bool, hook_seconds: Option<u64>) -> Result<()> {
             "  · 官网部分 4.x 包本身已是 ad-hoc，可直接用户态 LLDB hook，无需 sudo 重签。"
         );
         println!(
-            "  · 官方 Hardened Runtime 包：内存扫描请 sudo；补冷分片用 --hook-seconds。"
+            "  · 官方 Hardened Runtime 包的取钥还受目标 get-task-allow 授权约束；参见权限指南。"
         );
     }
 

@@ -28,3 +28,16 @@ __pycache__/
 Thumbs.db
 find_all_keys_macos
 .claude/worktrees/
+
+# 微信工作流的本机私有数据与第三方Skill安装目录
+.local/
+.agents/skills/
+.venv/
+
+apikeys_and_baseurl.md
+runs/
+
+# Local executable and explicitly saved private exports
+/bin/
+/exports/
+.claude/settings.local.json

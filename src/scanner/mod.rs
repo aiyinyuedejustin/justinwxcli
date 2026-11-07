@@ -377,6 +377,38 @@ pub(crate) fn scan_key_patterns(buf: &[u8], results: &mut Vec<(String, String)>)
     }
 }
 
+/// Config.Cipher's rotated XOR mask, observed in WeChat 4.x.
+/// Source: huohuoer/wechat-cli PRs 23 and 29. This only discovers candidates;
+/// match_key_hexes validates each candidate against the actual database page.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn scan_masked_key_patterns(buf: &[u8], results: &mut Vec<(String, String)>) {
+    const MASK: [u8; 32] = [0xd2,0xc7,0x44,0x24,0x58,0x02,0x00,0x00,0x00,0x48,0x89,0x44,0x24,0x50,0x48,0x8b,0x45,0x00,0x48,0x84,0x4c,0x24,0x48,0x48,0x89,0x44,0x25,0x40,0x48,0x58,0x4c,0x24];
+    let mut anchors = [0u32; 256];
+    for phase in 0..32 { anchors[(b'x' ^ MASK[phase]) as usize] |= 1 << phase; }
+    for start in 0..buf.len().saturating_sub(MAX_PATTERN_BYTES - 1) {
+        let mut phases = anchors[buf[start] as usize];
+        while phases != 0 {
+            let phase = phases.trailing_zeros() as usize;
+            phases &= phases - 1;
+            if buf[start + 1] ^ MASK[(phase + 1) % 32] != b'\'' { continue; }
+            let mut decoded = [0u8; MAX_PATTERN_BYTES];
+            let mut valid = true;
+            for j in 2..MAX_PATTERN_BYTES {
+                decoded[j] = buf[start+j] ^ MASK[(phase+j)%32];
+                if (j < 98 && !decoded[j].is_ascii_hexdigit()) || (j == 98 && decoded[j] != b'\'') {
+                    valid = false;
+                    break;
+                }
+            }
+            if valid {
+                let key = String::from_utf8_lossy(&decoded[2..66]).to_ascii_lowercase();
+                let salt = String::from_utf8_lossy(&decoded[66..98]).to_ascii_lowercase();
+                if !results.iter().any(|pair| pair.0 == key && pair.1 == salt) { results.push((key,salt)); }
+            }
+        }
+    }
+}
+
 /// 在缓冲区中寻找与已知 DB salt 相邻的 32 字节 binary key。
 ///
 /// 微信 4.x 每个 DB 使用独立 AES-256 key；密钥材料常以「key || salt」或
@@ -768,5 +800,22 @@ mod tests {
         collect_salt_adjacent_keys(&buf, &[salt], &mut out, &mut seen);
         let expect = key.iter().map(|b| format!("{:02x}", b)).collect::<String>();
         assert!(out.iter().any(|h| h == &expect), "got {out:?}");
+    }
+}
+
+#[cfg(test)]
+mod masked_tests {
+    use super::*;
+    #[test]
+    fn every_mask_phase_and_colliding_anchor_is_discovered() {
+        let mask=[0xd2,0xc7,0x44,0x24,0x58,0x02,0x00,0x00,0x00,0x48,0x89,0x44,0x24,0x50,0x48,0x8b,0x45,0x00,0x48,0x84,0x4c,0x24,0x48,0x48,0x89,0x44,0x25,0x40,0x48,0x58,0x4c,0x24];
+        let plain=format!("x'{}{}'","A".repeat(64),"B".repeat(32));
+        for phase in 0..32 {
+            let mut buf=vec![0xff;17];
+            buf.extend(plain.bytes().enumerate().map(|(i,b)|b^mask[(phase+i)%32]));
+            let mut result=Vec::new();scan_masked_key_patterns(&buf,&mut result);
+            assert_eq!(result,vec![("a".repeat(64),"b".repeat(32))],"phase {phase}");
+            let mut result=Vec::new();scan_masked_key_patterns(&buf[..buf.len()-1],&mut result);assert!(result.is_empty());
+        }
     }
 }
