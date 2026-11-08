@@ -119,13 +119,7 @@ fn start_daemon() -> Result<()> {
     // 而不是 spawn 一个注定失败的 daemon 然后超时 15s。
     preflight_cli_dir_writable()?;
 
-    // Bound retained logs across starts; clean --apply removes both files.
-    let log = config::log_path();
-    if log.metadata().is_ok_and(|m|m.len() > 5 * 1024 * 1024) {
-        let previous = log.with_file_name("daemon.log.1");
-        if previous.exists() { std::fs::remove_file(&previous)?; }
-        std::fs::rename(&log, previous)?;
-    }
+    crate::daemon::server::trim_log(&config::log_path())?;
 
     #[cfg(unix)]
     {

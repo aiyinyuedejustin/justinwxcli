@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 
 use crate::config;
 use crate::crypto;
@@ -17,6 +17,8 @@ struct MtimeEntry {
     db_mt: u64,
     wal_mt: u64,
     path: String,
+    #[serde(default)]
+    last_used: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -24,6 +26,27 @@ struct CacheEntry {
     db_mtime: u64,
     wal_mtime: u64,
     decrypted_path: PathBuf,
+    last_used: u64,
+}
+
+const CACHE_MAX_BYTES: u64 = 512 * 1024 * 1024;
+const CACHE_MAX_IDLE_SECONDS: u64 = 7 * 24 * 60 * 60;
+
+// Keep ownership inside the blocking producer, then transfer it to the installer.
+// Both failed production and failed installation remove the unfinished file.
+struct CacheTempFile(PathBuf);
+
+impl Drop for CacheTempFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+fn now_seconds() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 /// `DbCache::get_with_mode()` / `open_query_conn` 本次解析 rel_key 时实际走了哪条路径。
@@ -87,6 +110,9 @@ pub struct DbCache {
     rel_key_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     /// 序列化 mtime 持久化，避免并发 save 互相覆盖丢条目。
     save_lock: Mutex<()>,
+    /// IPC requests hold a read guard through their last database read.
+    /// Maintenance holds the write guard while reclaiming cached files.
+    pub(super) active_queries: RwLock<()>,
 }
 
 impl DbCache {
@@ -112,9 +138,11 @@ impl DbCache {
             inner: Arc::new(Mutex::new(HashMap::new())),
             rel_key_locks: Mutex::new(HashMap::new()),
             save_lock: Mutex::new(()),
+            active_queries: RwLock::new(()),
         };
 
         cache.load_persistent().await;
+        cache.maintain().await;
         Ok(cache)
     }
 
@@ -295,6 +323,7 @@ impl DbCache {
                 db_mtime: db_mt,
                 wal_mtime: wal_mt,
                 decrypted_path: final_path.to_path_buf(),
+                last_used: now_seconds(),
             },
         );
         Ok(Some(CacheResolve {
@@ -367,7 +396,10 @@ impl DbCache {
         let mut reused = 0usize;
         for (rel_key, entry) in &saved {
             let dec_path = PathBuf::from(&entry.path);
-            if !dec_path.exists() {
+            // Persistent metadata may only refer to this cache's generated paths.
+            if dec_path != self.cache_file_path(rel_key)
+                || !std::fs::symlink_metadata(&dec_path).is_ok_and(|m| m.is_file())
+            {
                 continue;
             }
             // 跳过无法打开的旧坏缓存（错 key 时代写入的 SQLITE_HDR 垃圾）
@@ -400,6 +432,11 @@ impl DbCache {
                         // 保留"cached 产物构建时看到的 wal_mtime"，让 `get()` 去比较当前 WAL
                         // 是否发生了变化，从而决定 exact-hit 还是 WAL 增量。
                         wal_mtime: entry.wal_mt,
+                        last_used: if entry.last_used == 0 {
+                            mtime_nanos(&dec_path) / 1_000_000_000
+                        } else {
+                            entry.last_used
+                        },
                         decrypted_path: dec_path,
                     },
                 );
@@ -426,6 +463,7 @@ impl DbCache {
                             db_mt: v.db_mtime,
                             wal_mt: v.wal_mtime,
                             path: v.decrypted_path.to_string_lossy().into_owned(),
+                            last_used: v.last_used,
                         },
                     )
                 })
@@ -434,10 +472,63 @@ impl DbCache {
 
         if let Ok(json) = serde_json::to_string_pretty(&data) {
             let tmp = mtime_file.with_extension("json.tmp");
+            let _cleanup = CacheTempFile(tmp.clone());
             if tokio::fs::write(&tmp, json).await.is_ok() {
                 let _ = tokio::fs::rename(&tmp, mtime_file).await;
             }
         }
+    }
+
+    pub async fn maintain(&self) {
+        match self.prune(CACHE_MAX_BYTES, CACHE_MAX_IDLE_SECONDS, now_seconds()).await {
+            Ok(bytes) if bytes > 0 => eprintln!("[cache] 自动回收 {} bytes", bytes),
+            Ok(_) => {},
+            Err(error) => eprintln!("[cache] 自动清理失败: {error:#}"),
+        }
+    }
+
+    async fn prune(&self, max_bytes: u64, max_idle: u64, now: u64) -> Result<u64> {
+        let _idle = self.active_queries.write().await;
+        let mut inner = self.inner.lock().await;
+        let known: HashMap<PathBuf, String> = inner.iter()
+            .map(|(key, entry)| (entry.decrypted_path.clone(), key.clone())).collect();
+        let mut retained = Vec::new();
+        let mut total = 0u64;
+        let mut reclaimed = 0u64;
+        for item in std::fs::read_dir(&self.cache_dir)? {
+            let item = item?;
+            let path = item.path();
+            let name = item.file_name();
+            let name = name.to_string_lossy();
+            let is_db = name.strip_suffix(".db")
+                .is_some_and(|stem| stem.len() == 32 && stem.bytes().all(|b| b.is_ascii_hexdigit()));
+            let is_temporary = name == "_mtimes.json.tmp" || name.strip_suffix(".db.tmp")
+                .is_some_and(|stem| stem.len() == 32 && stem.bytes().all(|b| b.is_ascii_hexdigit()));
+            if !is_db && !is_temporary { continue; }
+            let metadata = item.metadata()?;
+            if metadata.is_dir() { continue; }
+            if is_temporary || !known.contains_key(&path) {
+                std::fs::remove_file(&path)?;
+                reclaimed += metadata.len();
+                continue;
+            }
+            let key = &known[&path];
+            let entry = &inner[key];
+            total += metadata.len();
+            retained.push((entry.last_used, key.clone(), path, metadata.len()));
+        }
+        retained.sort_by(|a, b| (a.0, &a.1).cmp(&(b.0, &b.1)));
+        for (last_used, key, path, size) in retained {
+            if now.saturating_sub(last_used) >= max_idle || total > max_bytes {
+                std::fs::remove_file(&path)?;
+                inner.remove(&key);
+                total -= size;
+                reclaimed += size;
+            }
+        }
+        drop(inner);
+        self.save_persistent().await;
+        Ok(reclaimed)
     }
 
     /// 获取解密后的数据库路径
@@ -479,14 +570,18 @@ impl DbCache {
         // Path 1 fast path：不持 per-key 锁（只读，无写缓存文件）
         {
             let cached = {
-                let inner = self.inner.lock().await;
-                inner.get(rel_key).cloned()
+                let mut inner = self.inner.lock().await;
+                inner.get_mut(rel_key).map(|entry| {
+                    entry.last_used = now_seconds();
+                    entry.clone()
+                })
             };
             if let Some(entry) = cached {
                 if entry.db_mtime == db_mt
                     && entry.wal_mtime == wal_mt
                     && entry.decrypted_path.exists()
                 {
+                    self.save_persistent().await;
                     return Ok(Some(CacheResolve {
                         path: entry.decrypted_path,
                         mode: CacheMode::CacheHit,
@@ -512,8 +607,11 @@ impl DbCache {
             0
         };
         let cached = {
-            let inner = self.inner.lock().await;
-            inner.get(rel_key).cloned()
+            let mut inner = self.inner.lock().await;
+            inner.get_mut(rel_key).map(|entry| {
+                entry.last_used = now_seconds();
+                entry.clone()
+            })
         };
 
         let enc_key_bytes =
@@ -522,6 +620,7 @@ impl DbCache {
         if let Some(entry) = cached.as_ref() {
             if entry.db_mtime == db_mt && entry.decrypted_path.exists() {
                 if entry.wal_mtime == wal_mt {
+                    self.save_persistent().await;
                     return Ok(Some(CacheResolve {
                         path: entry.decrypted_path.clone(),
                         mode: CacheMode::CacheHit,
@@ -536,7 +635,8 @@ impl DbCache {
                 let tmp2 = tmp.clone();
                 let wal_path2 = wal_path.clone();
                 let key_copy = enc_key_bytes;
-                tokio::task::spawn_blocking(move || {
+                let _temporary = tokio::task::spawn_blocking(move || {
+                    let cleanup = CacheTempFile(tmp2.clone());
                     if tmp2.exists() {
                         let _ = std::fs::remove_file(&tmp2);
                     }
@@ -547,7 +647,7 @@ impl DbCache {
                         wal::apply_wal(&wal_path2, &tmp2, &key_copy)?;
                     }
                     Self::probe_decrypted_db(&tmp2)?;
-                    Ok::<_, anyhow::Error>(())
+                    Ok::<_, anyhow::Error>(cleanup)
                 })
                 .await??;
                 eprintln!(
@@ -585,7 +685,8 @@ impl DbCache {
         let tmp2 = tmp.clone();
         let wal_path3 = wal_path.clone();
         let key_copy = enc_key_bytes;
-        tokio::task::spawn_blocking(move || {
+        let _temporary = tokio::task::spawn_blocking(move || {
+            let cleanup = CacheTempFile(tmp2.clone());
             if !crypto::validate_raw_key_for_db(&db_path2, &key_copy) {
                 anyhow::bail!(
                     "密钥无法通过源库 HMAC/页头校验: {}（请 {} 或 wx key set）",
@@ -601,7 +702,7 @@ impl DbCache {
                 wal::apply_wal(&wal_path3, &tmp2, &key_copy)?;
             }
             Self::probe_decrypted_db(&tmp2)?;
-            Ok::<_, anyhow::Error>(())
+            Ok::<_, anyhow::Error>(cleanup)
         })
         .await??;
 
@@ -732,6 +833,92 @@ mod tests {
             .unwrap();
 
         (cache, db_path, decrypted_path, mtime_file, rel_key)
+    }
+
+    #[tokio::test]
+    async fn maintenance_reclaims_expired_oldest_and_unfinished_files_only() {
+        let (cache, source, expired_path, _, expired_key) = setup_seeded_cache("retention").await;
+        let root = source.parent().unwrap().parent().unwrap().to_path_buf();
+        let now = now_seconds();
+        let mut inner = cache.inner.lock().await;
+        inner.get_mut(&expired_key).unwrap().last_used = now - CACHE_MAX_IDLE_SECONDS - 1;
+        let mut paths = Vec::new();
+        for (key, age) in [("old.db", 100), ("new.db", 1)] {
+            let path = cache.cache_file_path(key);
+            write_minimal_sqlite(&path, key);
+            inner.insert(key.to_string(), CacheEntry {
+                db_mtime: 0, wal_mtime: 0, decrypted_path: path.clone(), last_used: now - age,
+            });
+            paths.push(path);
+        }
+        drop(inner);
+        let orphan = cache.cache_file_path("orphan.db");
+        let partial = DbCache::cache_tmp_path(&orphan);
+        let chosen_export = cache.cache_dir.join("chosen.jsonl");
+        for path in [&orphan, &partial, &chosen_export] {
+            std::fs::write(path, b"keep only explicit output").unwrap();
+        }
+        let newest_size = paths[1].metadata().unwrap().len();
+        assert!(cache.prune(newest_size, CACHE_MAX_IDLE_SECONDS, now).await.unwrap() > 0);
+        assert!(!expired_path.exists());
+        assert!(!paths[0].exists());
+        assert_eq!(sqlite_marker(&paths[1]), "new.db");
+        assert!(!orphan.exists());
+        assert!(!partial.exists());
+        assert_eq!(std::fs::read(&chosen_export).unwrap(), b"keep only explicit output");
+        assert_eq!(std::fs::read(&source).unwrap(), b"fake encrypted db");
+        let saved: HashMap<String, MtimeEntry> = serde_json::from_slice(
+            &std::fs::read(&cache.mtime_file).unwrap()).unwrap();
+        assert_eq!(saved.len(), 1);
+        assert!(saved.contains_key("new.db"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn maintenance_waits_for_readers_and_cache_hits_survive_restart() {
+        let (cache, source, cached, _, key) = setup_seeded_cache("retention-reader").await;
+        let root = source.parent().unwrap().parent().unwrap().to_path_buf();
+        cache.inner.lock().await.get_mut(&key).unwrap().last_used = 1;
+        cache.save_persistent().await;
+        cache.get(&key).await.unwrap();
+        let restarted = DbCache::with_dirs(cache.db_dir.clone(), cache.cache_dir.clone(),
+            cache.mtime_file.clone(), cache.all_keys.read().unwrap().clone()).await.unwrap();
+        assert!(cached.exists(), "cache hit refresh must survive restart");
+        let query = restarted.active_queries.read().await;
+        assert!(tokio::time::timeout(std::time::Duration::from_millis(20),
+            restarted.prune(0, 0, now_seconds())).await.is_err());
+        assert!(cached.exists(), "active query keeps its cached database");
+        drop(query);
+        restarted.prune(0, 0, now_seconds()).await.unwrap();
+        assert!(!cached.exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_wal_update_removes_temporary_copy_and_keeps_previous_database() {
+        let (cache, source, cached, _, key) = setup_seeded_cache("failed-wal").await;
+        let root = source.parent().unwrap().parent().unwrap().to_path_buf();
+        // Reading a directory as WAL fails after the cached DB has been copied.
+        std::fs::create_dir(wal_path_for(&source)).unwrap();
+        assert!(cache.get(&key).await.is_err());
+        assert!(!DbCache::cache_tmp_path(&cached).exists());
+        assert_eq!(sqlite_marker(&cached), "seed-v1");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn startup_ignores_metadata_pointing_outside_owned_cache() {
+        let (cache, source, _, metadata, key) = setup_seeded_cache("retention-path").await;
+        let root = source.parent().unwrap().parent().unwrap().to_path_buf();
+        let output = root.join("user-output.db");
+        std::fs::write(&output, b"user selected output").unwrap();
+        std::fs::write(&metadata, serde_json::json!({key: {
+            "db_mt": 0, "wal_mt": 0, "path": output,
+        }}).to_string()).unwrap();
+        DbCache::with_dirs(cache.db_dir.clone(), cache.cache_dir.clone(), metadata,
+            cache.all_keys.read().unwrap().clone()).await.unwrap();
+        assert_eq!(std::fs::read(&output).unwrap(), b"user selected output");
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]

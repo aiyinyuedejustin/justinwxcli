@@ -462,6 +462,14 @@ fn scan_region(
     bytes_read
 }
 
+struct HookDirectory(PathBuf);
+
+impl Drop for HookDirectory {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 /// 通过 LLDB 在用户/root 态 hook CommonCrypto，捕获 AES-256 key。
 ///
 /// 微信 4.x（尤其是 Tencent 官网 ad-hoc 包）在打开加密 DB 时会调用
@@ -472,8 +480,13 @@ fn hook_keys_via_lldb(pid: libc::pid_t, seconds: u64, allow_user: bool) -> Resul
     let lldb = find_lldb()
         .context("找不到 lldb。请安装 Xcode Command Line Tools：xcode-select --install")?;
 
-    let tmp_dir = std::env::temp_dir().join(format!("wx-cli-hook-{}", std::process::id()));
-    std::fs::create_dir_all(&tmp_dir)?;
+    if !allow_user && unsafe { libc::geteuid() } != 0 {
+        bail!("LLDB hook 需要 root 或 ad-hoc 签名的 WeChat");
+    }
+    let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos();
+    let tmp_dir = std::env::temp_dir().join(format!("wx-cli-hook-{}-{nonce}", std::process::id()));
+    std::fs::create_dir(&tmp_dir)?;
+    let _cleanup = HookDirectory(tmp_dir.clone());
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -501,10 +514,6 @@ fn hook_keys_via_lldb(pid: libc::pid_t, seconds: u64, allow_user: bool) -> Resul
             seconds,
         ),
     )?;
-
-    if !allow_user && unsafe { libc::geteuid() } != 0 {
-        bail!("LLDB hook 需要 root 或 ad-hoc 签名的 WeChat");
-    }
 
     let mut cmd = Command::new(&lldb);
     cmd.args([
@@ -540,7 +549,6 @@ fn hook_keys_via_lldb(pid: libc::pid_t, seconds: u64, allow_user: bool) -> Resul
                     use std::io::Read;
                     let _ = s.read_to_string(&mut stderr);
                 }
-                let _ = std::fs::remove_dir_all(&tmp_dir);
                 bail!(
                     "lldb 退出异常: {} {}",
                     status,
@@ -572,7 +580,6 @@ fn hook_keys_via_lldb(pid: libc::pid_t, seconds: u64, allow_user: bool) -> Resul
             keys.push(line);
         }
     }
-    let _ = std::fs::remove_dir_all(&tmp_dir);
     Ok(keys)
 }
 

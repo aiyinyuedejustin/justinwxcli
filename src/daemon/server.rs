@@ -8,10 +8,40 @@ use crate::ipc::{Request, Response};
 
 /// 启动 IPC server（Unix socket / Windows named pipe）
 pub async fn serve(db: Arc<DbCache>, names: Arc<tokio::sync::RwLock<Arc<Names>>>) -> Result<()> {
+    let maintenance_db = Arc::clone(&db);
+    let maintenance = async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            maintenance_db.maintain().await;
+            if let Err(error) = trim_log(&crate::config::log_path()) {
+                eprintln!("[server] 日志清理失败: {error:#}");
+            }
+        }
+    };
     #[cfg(unix)]
-    serve_unix(db, names).await?;
+    let server = serve_unix(db, names);
     #[cfg(windows)]
-    serve_windows(db, names).await?;
+    let server = serve_windows(db, names);
+    tokio::select! {
+        result = server => result,
+        _ = maintenance => Ok(()),
+    }
+}
+
+/// Truncate in place so the daemon's append-mode stdout/stderr keep the same file.
+/// The old startup-rotation backup is regenerable and can be reclaimed as well.
+pub(crate) fn trim_log(path: &std::path::Path) -> Result<()> {
+    if path.metadata().is_ok_and(|metadata| metadata.len() > 5 * 1024 * 1024) {
+        std::fs::OpenOptions::new().write(true).open(path)?.set_len(0)?;
+    }
+    let previous = path.with_file_name("daemon.log.1");
+    match std::fs::remove_file(previous) {
+        Ok(()) => {},
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+        Err(error) => return Err(error.into()),
+    }
     Ok(())
 }
 
@@ -136,6 +166,14 @@ async fn handle_connection_windows(
 async fn dispatch(req: Request, db: &DbCache, names: &tokio::sync::RwLock<Arc<Names>>) -> Response {
     use super::query;
     use crate::ipc::Request::*;
+
+    // Health checks must stay responsive while maintenance waits for a long query:
+    // a timed-out Ping makes the CLI start a second daemon.
+    let _active_query = if matches!(req, Ping) {
+        None
+    } else {
+        Some(db.active_queries.read().await)
+    };
 
     // 取 guard → O(1) clone Arc → 立即 drop 锁。后续 await 期间不持有锁，
     // 多个并发 IPC 请求可以真正并行。Names 本身不可变（由 daemon 启动时
@@ -447,4 +485,45 @@ async fn reload_config(
         "msg_shards": msg_db_keys.len(),
         "contacts": contact_count,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    #[tokio::test]
+    async fn ping_responds_while_cache_maintenance_holds_exclusive_access() {
+        let root = std::env::temp_dir().join(format!("wx-ping-cleanup-{}", std::process::id()));
+        let db = DbCache::with_dirs(root.join("source"), root.join("cache"),
+            root.join("cache/_mtimes.json"), Default::default()).await.unwrap();
+        let names = tokio::sync::RwLock::new(Arc::new(Names {
+            map: Default::default(), md5_to_uname: Default::default(),
+            msg_db_keys: Vec::new(), biz_msg_db_keys: Vec::new(), verify_flags: Default::default(),
+        }));
+        let maintenance = db.active_queries.write().await;
+        let response = tokio::time::timeout(std::time::Duration::from_millis(100),
+            dispatch(Request::Ping, &db, &names)).await.expect("Ping must stay responsive");
+        assert!(response.ok);
+        assert_eq!(response.data["pong"], true);
+        drop(maintenance);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn log_cleanup_keeps_append_handle_usable() {
+        let root = std::env::temp_dir().join(format!("wx-log-cleanup-{}", std::process::id()));
+        std::fs::create_dir(&root).unwrap();
+        let path = root.join("daemon.log");
+        let backup = root.join("daemon.log.1");
+        let mut active = std::fs::OpenOptions::new().create_new(true).append(true).open(&path).unwrap();
+        active.set_len(5 * 1024 * 1024 + 1).unwrap();
+        std::fs::write(&backup, b"old log").unwrap();
+        trim_log(&path).unwrap();
+        active.write_all(b"new log\n").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"new log\n");
+        assert!(!backup.exists());
+        drop(active);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
